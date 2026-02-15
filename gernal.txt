@@ -1,0 +1,76 @@
+RAFT-KV-STORE
+
+1st week
+
+1) Core Storage Engine
+- Implemented `MemoryStore` in `store/memory.go`.
+- Added in-memory data container: `map[string]string`.
+- Added concurrency safety with `sync.RWMutex`:
+  - `RLock` for concurrent readers.
+  - `Lock` for exclusive writes/deletes.
+- Added clean error handling:
+  - `ErrKeyEmpty` when key is empty.
+  - `ErrKeyNotFound` when key does not exist.
+- Added constructor `NewMemoryStore()` to initialize map safely.
+
+2) Storage Abstraction
+- Defined `Store` interface in `store/store.go` with:
+  - `Set(key, value) error`
+  - `Get(key) (string, error)`
+  - `Delete(key) error`
+- This allows API and higher layers to depend on behavior, not concrete type.
+
+3) HTTP Server Layer
+- Implemented REST handlers:
+  - `PUT /set`
+  - `GET /get?key=...`
+  - `DELETE /delete?key=...`
+- Implemented JSON request parsing and JSON responses.
+- Added status code handling:
+  - `400` bad request/input
+  - `404` key not found
+  - `500` internal error
+- Wired store into API through interface dependency.
+
+4) Logging and Operational Improvements
+- Added reusable logger in `utils/logger.go`.
+- Added request logging with:
+  - HTTP method
+  - path
+  - response status
+  - request latency
+- Added request ID middleware and response header `X-Request-ID`.
+- Added panic recovery middleware so panics return JSON `500` instead of crashing server.
+
+5) Scalability-Oriented Refactor
+- Added `config` layer in `config/config.go`.
+  - Reads `KVSTORE_PORT`, fallback `PORT`, default `8080`.
+- Refactored route setup into `api.NewRouter(handler)`.
+- Simplified `main.go` to wiring only (config + logger + store + router + server).
+- Added `store.NewDefaultStore()` provider function for future store swap.
+  - Current default: `MemoryStore`.
+  - Future target: `RaftStore` / replicated store without changing API code.
+
+6) Testing and Validation
+- Added unit test for basic behavior (`Set/Get/Delete`).
+- Added concurrency stress tests:
+  - mixed concurrent Set/Get/Delete
+  - heavy concurrent read tests
+  - deadlock timeout guard
+- Added benchmarks for write and read performance.
+- Ran tests with race detector to validate synchronization behavior.
+
+7) Tooling and Environment Fixes
+- Resolved package compile issue in `utils/logger.go` by adding package declaration.
+- Installed and configured MinGW-w64 compiler for race detection on Windows.
+- Updated Go C toolchain config (`CC`, `CXX`) and validated `go test -race ./...`.
+
+8) Documentation
+- Wrote a complete README with:
+  - project overview
+  - features
+  - architecture diagrams (current + future raft)
+  - API usage examples
+  - run/test instructions
+  - integration test notes
+  - roadmap and demo checklist
