@@ -200,3 +200,81 @@ curl.exe -X DELETE "http://localhost:8080/delete?key=name"
 - Log replication for writes
 - Fault tolerance tests (node stop/restart)
 - Replace `MemoryStore` wiring with `RaftStore` using same `store.Store` interface
+
+## Week 2 Demo
+✅ Week 2: Leader Election + Heartbeats
+
+Run 3 nodes:
+
+```powershell
+.\scripts\run-cluster.ps1
+```
+
+Check leader:
+
+```powershell
+Invoke-RestMethod http://localhost:8081/health
+Invoke-RestMethod http://localhost:8082/health
+Invoke-RestMethod http://localhost:8083/health
+```
+
+Expected:
+- Exactly one node returns `"state": "leader"`.
+- Leader returns `"leaderId"` equal to its `"id"`.
+- Followers usually return `"lastHeartbeatAgoMs"` below ~250ms.
+
+Failover demo:
+1. Identify leader using `/health`.
+2. Stop leader terminal (`Ctrl+C`).
+3. Observe one new leader within about 1-2 seconds.
+4. Restart old leader; it should rejoin as follower.
+
+One-command Day 6 verification:
+
+```powershell
+.\scripts\day6-kill-leader-test.ps1
+```
+
+## Leader Kill Demo (Repeatable)
+
+Start 3 nodes in separate PowerShell terminals:
+
+```powershell
+# Terminal 1
+$env:NODE_ID="n1"; $env:PORT="8081"; $env:PEERS="http://localhost:8082,http://localhost:8083"; go run .
+
+# Terminal 2
+$env:NODE_ID="n2"; $env:PORT="8082"; $env:PEERS="http://localhost:8081,http://localhost:8083"; go run .
+
+# Terminal 3
+$env:NODE_ID="n3"; $env:PORT="8083"; $env:PEERS="http://localhost:8081,http://localhost:8082"; go run .
+```
+
+Watch leader state continuously:
+
+```powershell
+.\scripts\watch-leader.ps1
+```
+
+Manual checks:
+
+```powershell
+Invoke-RestMethod http://localhost:8081/health
+Invoke-RestMethod http://localhost:8082/health
+Invoke-RestMethod http://localhost:8083/health
+```
+
+Kill the current leader with `Ctrl+C` in its terminal.
+Expected: within about 1-2 seconds one remaining node becomes leader.
+
+Acceptance checklist:
+- One leader remains stable for 10+ seconds.
+- Killing leader triggers new leader election in about 1-2 seconds.
+- Restarted old leader rejoins as follower.
+- `/health` reports exactly one leader across running nodes.
+
+Automated Day 6 test:
+
+```powershell
+.\scripts\day6-kill-leader-test.ps1
+```

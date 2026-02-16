@@ -74,3 +74,129 @@ RAFT-KV-STORE
   - run/test instructions
   - integration test notes
   - roadmap and demo checklist
+
+2nd week
+
+1) Cluster Config + Node Identity
+- Extended `config.Config` with:
+  - `NodeID string`
+  - `Peers []string`
+- Added env loading:
+  - `NODE_ID` (default: `node-<port>`)
+  - `PEERS` (comma-separated with space trimming)
+- Added self-peer filtering so node does not keep itself in peer list.
+- Kept empty peers valid for single-node mode.
+
+2) Health and Debug Endpoint
+- Added `GET /health`.
+- Health now reports cluster + raft state:
+  - `id`, `addr`, `peers`, `peersCount`
+  - `state`, `term`, `leaderId`
+  - `lastHeartbeatAgoMs`
+- Used this as the primary live debugger for leader election and failover checks.
+
+3) Router + Main Wiring Refactor
+- Changed wiring to pass config and raft node into router.
+- Updated main flow to:
+  - load config
+  - create logger and store
+  - create raft node
+  - run raft loop with context cancellation
+  - start HTTP server with unified router
+
+4) Raft Package Bootstrapping
+- Added `raft/types.go` with state enum:
+  - `Follower`, `Candidate`, `Leader`
+  - `String()` helper for readable state output
+- Added `raft/node.go` with core node fields:
+  - ids, peers, term, vote info, leader id
+  - election timers and mutex protection
+  - logger and transport wiring
+
+5) Raft RPC Types + HTTP Transport
+- Added `raft/rpc.go`:
+  - `RequestVoteRequest/Response`
+  - `AppendEntriesRequest/Response` (heartbeat-only for now)
+- Added `raft/transport_http.go`:
+  - `SendRequestVote(...)`
+  - `SendAppendEntries(...)`
+  - JSON POST to peer raft endpoints with timeout
+
+6) Vote Endpoint + Election Logic
+- Added internal endpoint: `POST /raft/requestvote`.
+- Implemented vote handling rules:
+  - reject stale terms
+  - step down on higher terms
+  - grant vote if not voted (or already voted same candidate)
+  - reset election timer on granted vote
+- Implemented outbound vote requests to peers during election.
+- Added vote counting and majority logic:
+  - tracks `votesReceived` and `electionTerm`
+  - ignores stale vote replies
+  - steps down on higher term replies
+  - becomes leader on majority
+
+7) AppendEntries Endpoint + Heartbeats
+- Added internal endpoint: `POST /raft/appendentries`.
+- Implemented heartbeat handling:
+  - reject stale term
+  - step down on higher term
+  - accept leader on current term
+  - reset election timer
+  - track `lastHeartbeat` timestamp
+- Added leader heartbeat loop:
+  - periodic AppendEntries to peers
+  - concurrent sends
+  - step down if higher term is observed
+
+8) Stability and Safety Improvements
+- Tuned timeouts for Windows/local stability:
+  - heartbeat: `100ms`
+  - election timeout: random `600-1200ms`
+- Added term-stamped heartbeat loops to prevent ghost heartbeats:
+  - heartbeat loop exits if state changes or term changes.
+- Ensured old election responses cannot corrupt new term/state.
+
+9) API File Separation (Week 3 friendly)
+- Split handlers for cleaner architecture:
+  - `api/kv_handlers.go` -> client API (`/set`, `/get`, `/delete`)
+  - `api/raft_handlers.go` -> raft internals + health
+- Kept `api/router.go` focused on route wiring.
+
+10) Scripts and Demo Automation
+- Added cluster bootstrap scripts:
+  - `scripts/run-node.ps1`
+  - `scripts/run-cluster.ps1`
+- Added live watcher:
+  - `scripts/watch-leader.ps1`
+- Added automated failover test:
+  - `scripts/day6-kill-leader-test.ps1`
+  - validates leader election, leader kill, re-election, and old leader rejoin behavior
+
+11) Logging Readability Upgrade
+- Standardized raft log prefixes for demos/debug:
+  - `ELECTION start term=X`
+  - `VOTE from peer votes=a/b term=X`
+  - `LEADER term=X`
+  - `HB from leader term=X`
+  - stepdown logs with higher-term reason
+
+12) Documentation Upgrade
+- Added README Week 2 demo section with:
+  - one-command cluster start
+  - health checks
+  - failover steps
+  - Day 6 verification script
+- Added `docs/demo.md` smoke runbook:
+  - run cluster
+  - kill leader
+  - restart old leader
+  - expected outputs
+
+13) Validation Done
+- Repeatedly validated with `go test ./...` after each major change.
+- Ran live 3-node checks:
+  - stable single leader
+  - successful re-election on leader kill
+  - restarted old leader rejoining as follower
+  - healthy heartbeat visibility via `/health`
