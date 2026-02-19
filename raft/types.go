@@ -20,3 +20,20 @@ func (s State) String() string {
 		return "unknown"
 	}
 }
+
+const (
+	OpSet    = "set"
+	OpDelete = "delete"
+)
+
+type Command struct {
+	Op    string `json:"op"`
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
+
+type LogEntry struct {
+	Term    int     `json:"term"`
+	Index   int     `json:"index"`
+	Command Command `json:"command"`
+}

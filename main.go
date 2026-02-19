@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"math/rand"
 	"net/http"
-	"time"
 
 	"kvstore/api"
 	"kvstore/config"
@@ -17,19 +15,24 @@ func main() {
 	cfg := config.Load()
 	logger := utils.NewLogger()
 	s := store.NewDefaultStore()
-	rand.Seed(time.Now().UnixNano())
 
-	raftNode := raft.NewNode(cfg.NodeID, cfg.Peers, logger.Logger)
-	raftCtx, raftCancel := context.WithCancel(context.Background())
-	defer raftCancel()
-	go raftNode.Run(raftCtx)
+	raftNode := raft.NewNode(cfg.NodeID, cfg.RaftPort, cfg.Peers, logger.Logger)
+	raftNode.BindStore(s)
+	raftNode.BindClientAddr(cfg.KVURL())
+	raftNode.BindAddressBook(cfg.NodeKV, cfg.NodeRaft)
+	go func() {
+		if err := raftNode.Start(); err != nil {
+			logger.Fatalf("raft server error: %v", err)
+		}
+	}()
 
 	router := api.NewRouter(s, logger, cfg, raftNode)
-	addr := cfg.Addr()
+	kvAddr := cfg.Addr()
 
-	logger.Printf("KV Store server running on http://localhost%s", addr)
-	if err := http.ListenAndServe(addr, router); err != nil {
-		raftCancel()
+	logger.Printf("KV Store server running on %s", cfg.KVURL())
+	logger.Printf("Raft server running on %s", cfg.RaftURL())
+	if err := http.ListenAndServe(kvAddr, router); err != nil {
+		_ = raftNode.Stop(context.Background())
 		logger.Fatalf("server error: %v", err)
 	}
 }

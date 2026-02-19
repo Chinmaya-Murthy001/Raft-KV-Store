@@ -20,6 +20,7 @@ func NewRouter(s store.Store, logger *utils.Logger, cfg config.Config, raftNode 
 	h := &Handler{
 		Store:  s,
 		Logger: logger,
+		Raft:   raftNode,
 	}
 	r := &Router{
 		handler: h,
@@ -32,8 +33,6 @@ func NewRouter(s store.Store, logger *utils.Logger, cfg config.Config, raftNode 
 	mux.HandleFunc("/get", r.handler.Get)
 	mux.HandleFunc("/delete", r.handler.Delete)
 	mux.HandleFunc("/health", r.Health)
-	mux.HandleFunc("/raft/requestvote", r.RequestVote)
-	mux.HandleFunc("/raft/appendentries", r.AppendEntries)
 
 	var root http.Handler = mux
 	root = panicRecoveryMiddleware(root, logger)

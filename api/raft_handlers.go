@@ -16,6 +16,7 @@ type healthResponse struct {
 	State              string   `json:"state"`
 	Term               int      `json:"term"`
 	LeaderID           string   `json:"leaderId"`
+	Leader             string   `json:"leader,omitempty"`
 	LastHeartbeatAgoMs int64    `json:"lastHeartbeatAgoMs"`
 }
 
@@ -33,6 +34,7 @@ func (r *Router) Health(w http.ResponseWriter, req *http.Request) {
 	state := "unknown"
 	term := 0
 	leaderID := ""
+	leader := ""
 	peersCount := len(r.cfg.Peers)
 	lastHeartbeatAgoMs := int64(-1)
 	if r.raft != nil {
@@ -41,6 +43,7 @@ func (r *Router) Health(w http.ResponseWriter, req *http.Request) {
 		state = snap.State
 		term = snap.Term
 		leaderID = snap.LeaderID
+		leader = snap.LeaderAddr
 		lastHeartbeatAgoMs = snap.LastHeartbeatAgoMs
 	}
 
@@ -52,6 +55,7 @@ func (r *Router) Health(w http.ResponseWriter, req *http.Request) {
 		State:              state,
 		Term:               term,
 		LeaderID:           leaderID,
+		Leader:             leader,
 		LastHeartbeatAgoMs: lastHeartbeatAgoMs,
 	}
 

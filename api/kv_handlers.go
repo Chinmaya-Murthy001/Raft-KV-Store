@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"kvstore/raft"
 	"kvstore/store"
 	"kvstore/utils"
 )
@@ -13,6 +14,7 @@ import (
 type Handler struct {
 	Store  store.Store
 	Logger *utils.Logger
+	Raft   *raft.Node
 }
 
 type setRequest struct {
@@ -21,10 +23,13 @@ type setRequest struct {
 }
 
 type apiResponse struct {
-	OK      bool   `json:"ok"`
-	Message string `json:"message,omitempty"`
-	Key     string `json:"key,omitempty"`
-	Value   string `json:"value,omitempty"`
+	OK       bool   `json:"ok"`
+	Error    string `json:"error,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Key      string `json:"key,omitempty"`
+	Value    string `json:"value,omitempty"`
+	LeaderID string `json:"leaderId,omitempty"`
+	Leader   string `json:"leader,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload apiResponse) {
@@ -61,16 +66,54 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.Store.Set(req.Key, req.Value); err != nil {
-		status := http.StatusInternalServerError
-		msg := "internal server error"
-		if errors.Is(err, store.ErrKeyEmpty) {
-			status = http.StatusBadRequest
-			msg = err.Error()
+	if h.Raft != nil {
+		_, _, err := h.Raft.Propose(raft.Command{
+			Op:    raft.OpSet,
+			Key:   req.Key,
+			Value: req.Value,
+		})
+		if err != nil {
+			status := http.StatusInternalServerError
+			msg := "internal server error"
+			errCode := "internal_error"
+			leaderHint := ""
+			leaderID := ""
+
+			var notLeader *raft.NotLeaderError
+			if errors.As(err, &notLeader) {
+				status = http.StatusConflict
+				msg = "not leader"
+				errCode = "not_leader"
+				if notLeader != nil {
+					leaderHint = notLeader.Leader
+					leaderID = notLeader.LeaderID
+				}
+			} else if errors.Is(err, raft.ErrProposalTimeout) {
+				status = http.StatusGatewayTimeout
+				msg = "proposal timeout"
+				errCode = "timeout"
+			} else if errors.Is(err, store.ErrKeyEmpty) {
+				status = http.StatusBadRequest
+				msg = err.Error()
+				errCode = "bad_request"
+			}
+
+			writeJSON(w, status, apiResponse{OK: false, Error: errCode, Message: msg, LeaderID: leaderID, Leader: leaderHint})
+			h.logRequest(r, start, status)
+			return
 		}
-		writeJSON(w, status, apiResponse{OK: false, Message: msg})
-		h.logRequest(r, start, status)
-		return
+	} else {
+		if err := h.Store.Set(req.Key, req.Value); err != nil {
+			status := http.StatusInternalServerError
+			msg := "internal server error"
+			if errors.Is(err, store.ErrKeyEmpty) {
+				status = http.StatusBadRequest
+				msg = err.Error()
+			}
+			writeJSON(w, status, apiResponse{OK: false, Message: msg})
+			h.logRequest(r, start, status)
+			return
+		}
 	}
 
 	status := http.StatusOK
@@ -125,9 +168,36 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := r.URL.Query().Get("key")
-	err := h.Store.Delete(key)
+	var err error
+	if h.Raft != nil {
+		_, _, err = h.Raft.Propose(raft.Command{
+			Op:  raft.OpDelete,
+			Key: key,
+		})
+	} else {
+		err = h.Store.Delete(key)
+	}
 
 	if err != nil {
+		var notLeader *raft.NotLeaderError
+		if errors.As(err, &notLeader) {
+			status := http.StatusConflict
+			leaderHint := ""
+			leaderID := ""
+			if notLeader != nil {
+				leaderHint = notLeader.Leader
+				leaderID = notLeader.LeaderID
+			}
+			writeJSON(w, status, apiResponse{OK: false, Error: "not_leader", Message: "not leader", LeaderID: leaderID, Leader: leaderHint})
+			h.logRequest(r, start, status)
+			return
+		}
+		if errors.Is(err, raft.ErrProposalTimeout) {
+			status := http.StatusGatewayTimeout
+			writeJSON(w, status, apiResponse{OK: false, Error: "timeout", Message: "proposal timeout"})
+			h.logRequest(r, start, status)
+			return
+		}
 		if errors.Is(err, store.ErrKeyNotFound) {
 			status := http.StatusNotFound
 			writeJSON(w, status, apiResponse{OK: false, Message: "key not found"})

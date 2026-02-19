@@ -200,3 +200,124 @@ RAFT-KV-STORE
   - successful re-election on leader kill
   - restarted old leader rejoining as follower
   - healthy heartbeat visibility via `/health`
+
+3rd week
+
+1) Cluster-Aware Config Expansion
+- Extended `config/config.go` for multi-node Raft wiring:
+  - `NODE_ID`
+  - `RAFT_PORT`
+  - `PEERS` (comma-separated raft peer URLs)
+- Added cluster address-book fields:
+  - `NodeKV map[string]string`
+  - `NodeRaft map[string]string`
+- Added URL helpers:
+  - `KVURL()`
+  - `RaftURL()`
+- Added optional `PEER_IDS` support to map peer IDs to addresses cleanly.
+
+2) Raft Package Completion (Week 3 model)
+- Added/expanded `raft/types.go` and `raft/node.go` with core Raft state:
+  - persistent-ish: `currentTerm`, `votedFor`, `log []LogEntry`
+  - volatile: `commitIndex`, `lastApplied`
+  - leader-only: `nextIndex`, `matchIndex`
+- Log model includes:
+  - `Command { Op, Key, Value }`
+  - `LogEntry { Term, Index, Command }`
+- Added `Start()` and `Status()` behavior for runtime and observability.
+
+3) Raft HTTP Endpoints
+- Added `raft/http.go` routes:
+  - `GET /raft/status`
+  - `POST /raft/appendentries`
+  - `POST /raft/requestvote`
+- Status now reports:
+  - `node_id`, `state`, `term`
+  - `commitIndex`, `lastApplied`
+  - `logLen`, `lastLogIndex`, `lastLogTerm`
+  - `leaderId`, `leaderAddr`, `peers`
+  - `nextIndex` and `matchIndex` for leader
+
+4) Dual-Server Runtime (KV + Raft)
+- Updated `main.go` to run:
+  - KV client API on `KVSTORE_PORT`
+  - Raft internal RPC on `RAFT_PORT` (goroutine)
+- Bound raft node to store + client address + cluster address book:
+  - `BindStore(...)`
+  - `BindClientAddr(...)`
+  - `BindAddressBook(...)`
+
+5) Leader Heartbeats + Election Stability
+- Implemented periodic leader heartbeats (~100ms) using AppendEntries.
+- Followers reset election timers on valid AppendEntries.
+- Reduced follower candidate spam while leader is alive.
+- Implemented leader step-down on receiving higher term responses.
+
+6) Replication Catch-Up Logic
+- Leader now sends real log entries (not only empty heartbeats):
+  - per-peer `start := nextIndex[peer]`
+  - `PrevLogIndex = start-1`, `PrevLogTerm` from local log
+- On AppendEntries response:
+  - success: update `matchIndex` + `nextIndex`
+  - fail: back off `nextIndex` and retry next cycle
+- Implemented prev-log consistency rejection on followers.
+- Supports lagging follower catch-up and conflict-tail overwrite behavior.
+
+7) Commit Advancement (Majority + Safety Rule)
+- Added leader commit advancement using `matchIndex[]` majority counting.
+- Enforced Raft safety condition:
+  - commit only if `log[N].Term == currentTerm`
+- Leader propagates `LeaderCommit` in AppendEntries.
+- Followers update `commitIndex = min(LeaderCommit, lastLogIndex)`.
+
+8) Apply Pipeline (Committed Entries Only)
+- Added apply channel and apply loop:
+  - `applyCh chan LogEntry`
+  - committed entries queued and applied outside long lock holds
+- Added apply adapter:
+  - `set` -> `store.Set(...)`
+  - `delete` -> `store.Delete(...)`
+- Added apply logs:
+  - `[apply] index=... op=... key=... value=...`
+- Ensured apply occurs only when `lastApplied < commitIndex`.
+
+9) Write Path Through Raft (No Local Follower Writes)
+- Added leader guard on write endpoints (`/set`, `/delete`):
+  - followers return HTTP `409`
+  - JSON includes actionable leader hint
+- Implemented `raft.Node.Propose(cmd)`:
+  - leader-only proposal acceptance
+  - append entry to log
+  - trigger immediate replication
+  - wait for commit or timeout
+- Added minimal waiter map for sync proposals:
+  - `waitCh map[int]chan struct{}` keyed by log index
+- KV mutations now happen via Raft apply loop, not direct write handler mutation.
+
+10) Leader Hint Usability Fix
+- Corrected not-leader response to return leader KV API URL (client-facing), not raft port.
+- Added structured response fields:
+  - `ok`, `error`, `message`, `leaderId`, `leader`
+- Leader identity is learned from AppendEntries and resolved via address book.
+
+11) Demo/Test Harness Automation
+- Added/updated PowerShell automation:
+  - `scripts/demo.ps1` for cluster demo flow
+  - `scripts/test-ah.ps1` for full A-H checklist execution
+- Included not-leader retry flow in harness behavior.
+
+12) Validation in This Session
+- Ran `go test ./...` during Week 3 changes.
+- Executed full distributed checklist A-H on 3-node cluster (`KV 8080-8082`, `Raft 9080-9082`):
+  - A1 exactly one leader: PASS
+  - A2 no follower election spam: PASS
+  - B1 follower write returns not leader + KV leader hint: PASS
+  - B2 leader write commits/applies: PASS
+  - C1 read-your-write on all nodes: PASS
+  - C2 ordered sequential writes: PASS
+  - D1 lagging follower catch-up: PASS
+  - E1 conflicting uncommitted tail resolution (optional scenario): PASS
+  - F1 commit with one follower down: PASS
+  - F2 no majority -> no commit: PASS
+  - G1 leader crash + recovery continuity: PASS
+  - H1 exactly-once apply per index/node: PASS
