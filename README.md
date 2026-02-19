@@ -1,280 +1,182 @@
 # RAFT-KV-STORE
+Go key-value store with Raft-based leader election, log replication, commit/apply, and fault-tolerant behavior for a 3-node cluster.
 
-RAFT-KV-STORE is a Go-based key-value store built to evolve from a single-node in-memory engine into a distributed Raft-backed system.
+## Week 3 Status
+- Raft and KV run on separate ports per node (client traffic and internal Raft RPC are split).
+- Writes are leader-only and go through Raft `Propose` and commit.
+- Followers reject writes with actionable leader KV hint (`409 not_leader`).
+- Leader replicates using `nextIndex` and `matchIndex` with backtracking.
+- Commit index advances only on majority and current-term safety rule.
+- Committed entries are applied via apply loop on every node.
+- Catch-up, failover, and no-majority safety are validated.
 
 ## Features
-- In-memory key-value storage with `map[string]string`
-- Thread-safe operations using `sync.RWMutex`
-- Clean store abstraction via `store.Store` interface
-- REST API:
+- Thread-safe in-memory store (`map[string]string` + `sync.RWMutex`).
+- Store abstraction via `store.Store` interface.
+- Client API:
   - `PUT /set`
   - `GET /get?key=...`
   - `DELETE /delete?key=...`
-- Consistent JSON responses
-- HTTP status mapping: `400`, `404`, `500`
-- Request logging with latency and request ID
-- Panic recovery middleware (returns JSON `500` instead of crashing)
-- Configurable server port through environment variables
-- Concurrency tests, stress tests, and benchmarks
+  - `GET /health`
+- Internal Raft API:
+  - `GET /raft/status`
+  - `POST /raft/appendentries`
+  - `POST /raft/requestvote`
+- Leader election + periodic heartbeats.
+- Log replication + follower catch-up.
+- Majority commit + apply-on-commit only.
+- Request IDs, request latency logging, panic recovery middleware.
+
+## Configuration
+Environment variables:
+- `KVSTORE_PORT` (client API port, fallback `PORT`, default `8080`)
+- `RAFT_PORT` (internal Raft port, default `KVSTORE_PORT + 1000`)
+- `NODE_ID` (default `node-<port>`)
+- `PEERS` (comma-separated Raft peer URLs)
+- `PEER_IDS` (optional, comma-separated peer IDs aligned with `PEERS`)
+
+Example:
+```powershell
+$env:NODE_ID="n1"
+$env:KVSTORE_PORT="8081"
+$env:RAFT_PORT="9081"
+$env:PEERS="http://localhost:9082,http://localhost:9083"
+$env:PEER_IDS="n2,n3"
+go run .
+```
+
+## API Behavior
+`PUT /set` body:
+```json
+{"key":"name","value":"luffy"}
+```
+
+Success (`200`):
+```json
+{"ok":true,"message":"stored","key":"name"}
+```
+
+Write to follower (`409`):
+```json
+{
+  "ok": false,
+  "error": "not_leader",
+  "message": "not leader",
+  "leaderId": "n3",
+  "leader": "http://localhost:8082"
+}
+```
+
+`GET /get?key=name` success (`200`):
+```json
+{"ok":true,"key":"name","value":"luffy"}
+```
+
+`GET /raft/status` includes:
+- `state`, `term`, `leaderId`
+- `logLen`, `lastLogIndex`, `lastLogTerm`
+- `commitIndex`, `lastApplied`
+- `peers`
+- `nextIndex`, `matchIndex` (leader only)
 
 ## Project Structure
 ```text
 .
 |-- api/
-|   |-- handlers.go
+|   |-- kv_handlers.go
+|   |-- raft_handlers.go
 |   |-- middleware.go
 |   `-- router.go
 |-- config/
 |   `-- config.go
+|-- raft/
+|   |-- types.go
+|   |-- rpc.go
+|   |-- transport_http.go
+|   |-- http.go
+|   |-- node.go
+|   |-- node_apply_test.go
+|   |-- node_replication_test.go
+|   `-- replication_scenarios_test.go
+|-- scripts/
+|   |-- run-node.ps1
+|   |-- run-cluster.ps1
+|   |-- watch-leader.ps1
+|   |-- day6-kill-leader-test.ps1
+|   |-- demo.ps1
+|   `-- test-ah.ps1
 |-- store/
-|   |-- errors.go
-|   |-- memory.go
-|   |-- provider.go
 |   |-- store.go
+|   |-- provider.go
+|   |-- memory.go
+|   |-- errors.go
 |   |-- memory_test.go
 |   |-- concurrency_test.go
 |   `-- bench_test.go
-|-- utils/
-|   `-- logger.go
+|-- utils/logger.go
 `-- main.go
 ```
 
-## Architecture (Current)
-```text
-Client
-  |
-  v
-HTTP API (Router + Middleware + Handlers)
-  |
-  v
-Store Interface (store.Store)
-  |
-  v
-MemoryStore (in-memory map + RWMutex)
-```
-
-## Architecture (Future - Raft)
-```text
-            +-------------------+
-Client ---> | API Node A        |
-            | Handler -> Store  |
-            +---------+---------+
-                      |
-                      v
-              +---------------+
-              | RaftStore     |
-              | (leader/fwd)  |
-              +--+---------+--+
-                 |         |
-                 v         v
-          +-----------+ +-----------+
-          | Node B    | | Node C    |
-          | Replicas  | | Replicas  |
-          +-----------+ +-----------+
-```
-
-## API Endpoints
-
-### `PUT /set`
-Stores or updates a key.
-
-Request body:
-```json
-{"key":"name","value":"luffy"}
-```
-
-Success response (`200`):
-```json
-{"ok":true,"message":"stored","key":"name"}
-```
-
-### `GET /get?key=name`
-Fetches a value by key.
-
-Success response (`200`):
-```json
-{"ok":true,"key":"name","value":"luffy"}
-```
-
-### `DELETE /delete?key=name`
-Deletes a key.
-
-Success response (`200`):
-```json
-{"ok":true,"message":"deleted","key":"name"}
-```
-
-### Error Response Shape
-All errors use:
-```json
-{"ok":false,"message":"..."}
-```
-
-Status mapping:
-- `400` bad input (invalid JSON, empty key)
-- `404` key not found
-- `500` internal server error
-
-## Run
-Default port is `8080`.
-
-Environment options:
-- `KVSTORE_PORT`
-- fallback: `PORT`
-
-Examples:
+## Run Cluster
+Start 3 nodes in separate terminals:
 ```powershell
-go run .
+.\scripts\run-cluster.ps1
 ```
+Defaults used by that script:
+- `n1`: KV `8081`, Raft `9081`
+- `n2`: KV `8082`, Raft `9082`
+- `n3`: KV `8083`, Raft `9083`
 
+Check cluster health:
 ```powershell
-$env:KVSTORE_PORT="8090"
-go run .
+Invoke-RestMethod http://localhost:8081/health
+Invoke-RestMethod http://localhost:8082/health
+Invoke-RestMethod http://localhost:8083/health
 ```
 
-## Test
+Check Raft internals:
+```powershell
+Invoke-RestMethod http://localhost:9081/raft/status
+Invoke-RestMethod http://localhost:9082/raft/status
+Invoke-RestMethod http://localhost:9083/raft/status
+```
+
+## Demo and Validation Scripts
+- Week 3 demo flow:
+```powershell
+.\scripts\demo.ps1
+```
+- Leader kill/re-election validation:
+```powershell
+.\scripts\day6-kill-leader-test.ps1
+```
+- Full A-H checklist harness:
+```powershell
+.\scripts\test-ah.ps1
+```
+
+Latest A-H run status:
+- `A1` PASS, `A2` PASS
+- `B1` PASS, `B2` PASS
+- `C1` PASS, `C2` PASS
+- `D1` PASS
+- `E1` PASS (optional conflict scenario)
+- `F1` PASS, `F2` PASS
+- `G1` PASS
+- `H1` PASS
+
+## Tests
 Run all tests:
 ```powershell
 go test ./...
 ```
 
-Run race detector:
+Race detector:
 ```powershell
 go test -race ./...
 ```
 
-Run benchmarks:
+Store benchmarks:
 ```powershell
 go test ./store -bench=. -benchmem -run ^$
-```
-
-## Integration Test Notes
-
-### PowerShell (`Invoke-RestMethod`)
-Set:
-```powershell
-Invoke-RestMethod -Method Put -Uri "http://localhost:8080/set" `
-  -ContentType "application/json" `
-  -Body '{"key":"name","value":"luffy"}'
-```
-
-Get:
-```powershell
-Invoke-RestMethod -Method Get -Uri "http://localhost:8080/get?key=name"
-```
-
-Delete:
-```powershell
-Invoke-RestMethod -Method Delete -Uri "http://localhost:8080/delete?key=name"
-```
-
-### `curl.exe`
-Set:
-```powershell
-curl.exe -X PUT "http://localhost:8080/set" ^
-  -H "Content-Type: application/json" ^
-  -d "{\"key\":\"name\",\"value\":\"luffy\"}"
-```
-
-Get:
-```powershell
-curl.exe "http://localhost:8080/get?key=name"
-```
-
-Delete:
-```powershell
-curl.exe -X DELETE "http://localhost:8080/delete?key=name"
-```
-
-## 2-Min Demo Checklist
-1. Start server: `go run .`
-2. `PUT /set` for a key/value
-3. `GET /get` the same key
-4. `DELETE /delete` the key
-5. Show logs with request IDs and latency for each call
-
-## Roadmap
-### Week 2 (Planned)
-- Multi-node cluster bootstrapping
-- Raft leader election
-- Log replication for writes
-- Fault tolerance tests (node stop/restart)
-- Replace `MemoryStore` wiring with `RaftStore` using same `store.Store` interface
-
-## Week 2 Demo
-✅ Week 2: Leader Election + Heartbeats
-
-Run 3 nodes:
-
-```powershell
-.\scripts\run-cluster.ps1
-```
-
-Check leader:
-
-```powershell
-Invoke-RestMethod http://localhost:8081/health
-Invoke-RestMethod http://localhost:8082/health
-Invoke-RestMethod http://localhost:8083/health
-```
-
-Expected:
-- Exactly one node returns `"state": "leader"`.
-- Leader returns `"leaderId"` equal to its `"id"`.
-- Followers usually return `"lastHeartbeatAgoMs"` below ~250ms.
-
-Failover demo:
-1. Identify leader using `/health`.
-2. Stop leader terminal (`Ctrl+C`).
-3. Observe one new leader within about 1-2 seconds.
-4. Restart old leader; it should rejoin as follower.
-
-One-command Day 6 verification:
-
-```powershell
-.\scripts\day6-kill-leader-test.ps1
-```
-
-## Leader Kill Demo (Repeatable)
-
-Start 3 nodes in separate PowerShell terminals:
-
-```powershell
-# Terminal 1
-$env:NODE_ID="n1"; $env:PORT="8081"; $env:PEERS="http://localhost:8082,http://localhost:8083"; go run .
-
-# Terminal 2
-$env:NODE_ID="n2"; $env:PORT="8082"; $env:PEERS="http://localhost:8081,http://localhost:8083"; go run .
-
-# Terminal 3
-$env:NODE_ID="n3"; $env:PORT="8083"; $env:PEERS="http://localhost:8081,http://localhost:8082"; go run .
-```
-
-Watch leader state continuously:
-
-```powershell
-.\scripts\watch-leader.ps1
-```
-
-Manual checks:
-
-```powershell
-Invoke-RestMethod http://localhost:8081/health
-Invoke-RestMethod http://localhost:8082/health
-Invoke-RestMethod http://localhost:8083/health
-```
-
-Kill the current leader with `Ctrl+C` in its terminal.
-Expected: within about 1-2 seconds one remaining node becomes leader.
-
-Acceptance checklist:
-- One leader remains stable for 10+ seconds.
-- Killing leader triggers new leader election in about 1-2 seconds.
-- Restarted old leader rejoins as follower.
-- `/health` reports exactly one leader across running nodes.
-
-Automated Day 6 test:
-
-```powershell
-.\scripts\day6-kill-leader-test.ps1
 ```
