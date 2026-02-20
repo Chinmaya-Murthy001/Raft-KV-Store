@@ -1,0 +1,16 @@
+# build
+*.exe
+*.out
+*.test
+bin/
+dist/
+
+# logs / runtime artifacts
+tmp-test-logs/
+data/
+*.log
+
+# editors
+.vscode/
+.idea/
+.DS_Store
