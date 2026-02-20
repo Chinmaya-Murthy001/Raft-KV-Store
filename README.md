@@ -10,6 +10,14 @@ Go key-value store with Raft-based leader election, log replication, commit/appl
 - Committed entries are applied via apply loop on every node.
 - Catch-up, failover, and no-majority safety are validated.
 
+## Week 4 Adds
+- Persistent Raft stable state on disk: `currentTerm`, `votedFor`, `log`.
+- Crash recovery with persisted state and replay/restore on restart.
+- Strong write semantics: writes return success only after majority commit.
+- Leader crash/re-election/rejoin flows validated.
+- Crash-before-commit safety validated (`uncommitted` entries do not appear).
+- Local snapshot + log compaction (`snapshot.json`) with restart restore.
+
 ## Features
 - Thread-safe in-memory store (`map[string]string` + `sync.RWMutex`).
 - Store abstraction via `store.Store` interface.
@@ -33,7 +41,10 @@ Environment variables:
 - `RAFT_PORT` (internal Raft port, default `KVSTORE_PORT + 1000`)
 - `NODE_ID` (default `node-<port>`)
 - `PEERS` (comma-separated Raft peer URLs)
+- `RAFT_NODES` (alias for `PEERS`, used by some harnesses)
 - `PEER_IDS` (optional, comma-separated peer IDs aligned with `PEERS`)
+- `RAFT_DATA_DIR` (optional base dir for persisted Raft data; node ID is appended)
+- `RAFT_SNAPSHOT_THRESHOLD` (optional snapshot trigger threshold, default `50`)
 
 Example:
 ```powershell
@@ -46,6 +57,11 @@ go run .
 ```
 
 ## API Behavior
+Client semantics:
+- Writes (`PUT /set`, `DELETE /delete`) return success only after majority commit.
+- If majority is unavailable, writes fail (typically timeout) and are not applied.
+- Reads (`GET /get`) are served from the node's local store (eventual consistency during failover/catch-up windows).
+
 `PUT /set` body:
 ```json
 {"key":"name","value":"luffy"}
@@ -153,6 +169,18 @@ Invoke-RestMethod http://localhost:9083/raft/status
 - Full A-H checklist harness:
 ```powershell
 .\scripts\test-ah.ps1
+```
+- One-command Week 4 runner (Week 3 regression + P1/P2/P3 + S1):
+```powershell
+.\scripts\test-week4.ps1
+```
+- Week 4 P3 crash-before-commit safety:
+```powershell
+.\scripts\test-week4-p3.ps1
+```
+- Day 6 S1 snapshot-restart validation:
+```powershell
+.\scripts\test-day6-s1.ps1
 ```
 
 Latest A-H run status:

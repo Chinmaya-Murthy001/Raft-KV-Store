@@ -114,7 +114,7 @@ func replicateUntilSettled(t *testing.T, leader *Node, peer string, follower *No
 		resp := follower.HandleAppendEntries(req)
 
 		leader.mu.Lock()
-		_ = leader.handleAppendResponseLocked(peer, requestTerm, prevLogIndex, sentLen, resp)
+		leader.handleAppendResponseLocked(peer, requestTerm, prevLogIndex, sentLen, resp)
 		leaderLast := leader.lastLogIndexLocked()
 		peerMatch := leader.matchIndex[peer]
 		leader.mu.Unlock()

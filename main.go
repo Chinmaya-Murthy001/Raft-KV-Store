@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 
 	"kvstore/api"
 	"kvstore/config"
@@ -16,8 +17,16 @@ func main() {
 	logger := utils.NewLogger()
 	s := store.NewDefaultStore()
 
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		logger.Fatalf("mkdir data dir: %v", err)
+	}
+
 	raftNode := raft.NewNode(cfg.NodeID, cfg.RaftPort, cfg.Peers, logger.Logger)
 	raftNode.BindStore(s)
+	raftNode.SetSnapshotThreshold(cfg.SnapshotThreshold)
+	if err := raftNode.InitPersistence(cfg.DataDir); err != nil {
+		logger.Fatalf("raft persistence init error: %v", err)
+	}
 	raftNode.BindClientAddr(cfg.KVURL())
 	raftNode.BindAddressBook(cfg.NodeKV, cfg.NodeRaft)
 	go func() {

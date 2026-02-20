@@ -321,3 +321,116 @@ RAFT-KV-STORE
   - F2 no majority -> no commit: PASS
   - G1 leader crash + recovery continuity: PASS
   - H1 exactly-once apply per index/node: PASS
+
+4th week
+
+1) Repo Hygiene and Baseline Quality
+- Added root `.gitignore` for:
+  - runtime artifacts (`tmp-test-logs/`, `data/`, `*.log`)
+  - build artifacts (`*.exe`, `*.out`, `*.test`, `bin/`, `dist/`)
+  - editor/system files (`.vscode/`, `.idea/`, `.DS_Store`)
+- Ran formatting and validation repeatedly:
+  - `gofmt -w .`
+  - `go test ./...`
+- Kept runtime artifacts out of git while allowing scripts to create folders at runtime.
+
+2) Persistent Raft State (Day 1-2 Foundation)
+- Added `raft/persist.go` with atomic JSON persistence:
+  - `StableState { currentTerm, votedFor, log }`
+  - `Load()` / `Save()` using temp file + `Sync()` + `Rename()`
+- Added `RAFT_DATA_DIR` support in config and startup wiring:
+  - per-node data paths under a base directory
+  - auto `MkdirAll` on startup
+- Added node bootstrap persistence initialization before raft loops start.
+
+3) Persistence Hooks on State Mutation
+- Added centralized `persistLocked()` on `Node`.
+- Persist now happens on all stable-state mutation paths:
+  - `currentTerm` changes / step-down on higher term
+  - `votedFor` updates (vote granted/cleared)
+  - log mutations on leader append and follower conflict resolution
+- Coalesced persistence in handlers using `dirty` flags to reduce write amplification.
+
+4) Restart and Apply Semantics Hardening
+- Adopted restart behavior to rebuild state safely from persisted Raft data.
+- Reworked apply flow for strict monotonicity:
+  - apply only committed indices in order
+  - `lastApplied` advances only after successful apply
+- Removed queue-style pre-advance behavior that could violate apply-after-success semantics.
+
+5) Week 4/5 Functional Tests Added (Go)
+- Added persistence/unit tests:
+  - `raft/persist_test.go` (stable state + snapshot roundtrip tests)
+- Added restart/recovery scenario tests:
+  - `TestP1FollowerRestartCatchesUp`
+  - `TestP2LeaderCrashAndRestartRejoinsAsFollower`
+  - `TestP4NoDoubleApplyAcrossRestarts`
+  - leader hint update test after re-elections
+- Added higher-term step-down correctness tests:
+  - append handler and append-reply paths.
+
+6) Critical Crash-Safety Scenario (P3)
+- Added script `scripts/test-week4-p3.ps1`:
+  - isolate leader (kill 2 followers)
+  - issue uncommittable write
+  - crash/restart cluster with same persistent dirs
+  - verify key never appears
+- Validated with live run: PASS (`z` absent everywhere after restart).
+
+7) Snapshot and Log Compaction (Day 6 Local Snapshot)
+- Extended persistence model with snapshot file:
+  - `snapshot.json`
+  - `Snapshot { lastIncludedIndex, lastIncludedTerm, kv }`
+- Added atomic snapshot `LoadSnapshot()` / `SaveSnapshot()`.
+- Added log-base indexing support:
+  - `logBaseIndex`, `logBaseTerm`
+  - base-aware index mapping and term lookup.
+- Added local snapshot trigger (`RAFT_SNAPSHOT_THRESHOLD`):
+  - snapshot at safe point (`lastApplied`)
+  - compact log <= snapshot index
+  - persist compacted stable state.
+- Added startup restore order:
+  - load snapshot -> restore KV
+  - load stable state
+  - initialize `commitIndex`/`lastApplied` at snapshot base.
+- Extended raft status with `logBaseIndex`/`logBaseTerm` for observability.
+
+8) Store Snapshot Support
+- Extended `MemoryStore` with:
+  - `Snapshot() map[string]string`
+  - `Restore(map[string]string)`
+- Used by Raft snapshot/restore path.
+
+9) Harness and Reliability Improvements
+- Added stable-leader helpers with consecutive-check logic to reduce election flakiness.
+- Added helper aliases (`Wait-LeaderStable`, `Wait-Key`) for consistent harness usage.
+- Updated A-H harness to use per-run isolated `RAFT_DATA_DIR` roots (prevents state leakage across runs).
+
+10) New End-to-End Scripts
+- Added:
+  - `scripts/persistence-smoke.ps1` (P1 flow)
+  - `scripts/day4-smoke.ps1` (P2 flow)
+  - `scripts/test-week4-p3.ps1` (P3 flow)
+  - `scripts/test-day6-s1.ps1` (S1 snapshot-restart flow)
+  - `scripts/test-week4.ps1` (one-command Week 4 runner)
+- `scripts/test-week4.ps1` sequence:
+  - `go test ./...`
+  - Week 3 regression (`test-ah.ps1`)
+  - P1, P2, P3, S1
+
+11) Documentation Updates
+- README updated with:
+  - Week 4 additions section
+  - client semantics (writes succeed only after majority commit)
+  - env vars including `RAFT_NODES` alias, `RAFT_DATA_DIR`, `RAFT_SNAPSHOT_THRESHOLD`
+  - Week 4 and Day 6 script commands.
+- `docs/demo.md` updated with explicit Week 4 demo/runbook flow.
+
+12) Final Validation in This Session
+- Ran `go test ./...` multiple times after each major change: PASS.
+- Ran live scenario scripts and confirmed PASS:
+  - P1 follower restart catch-up
+  - P2 leader crash/restart rejoin
+  - P3 uncommitted entry never appears after crash
+  - S1 snapshot survives restart and KV remains correct
+- Ran `scripts/test-week4.ps1` back-to-back successfully (twice), then once more after final harness naming polish: PASS.

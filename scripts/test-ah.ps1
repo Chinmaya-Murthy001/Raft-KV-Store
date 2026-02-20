@@ -8,6 +8,9 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 $logRoot = Join-Path $repo "tmp-test-logs"
 New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+$sessionTag = Get-Date -Format "yyyyMMdd-HHmmss"
+$currentDataRoot = ""
+$snapshotThreshold = 100000
 
 $nodeCfg = [ordered]@{
     n1 = [ordered]@{ KV = 8080; Raft = 9080; Peers = "http://localhost:9081,http://localhost:9082"; PeerIDs = "n2,n3" }
@@ -61,15 +64,17 @@ function Start-Node([string]$id) {
     }
 
     $job = Start-Job -Name ("raft-" + $id) -ScriptBlock {
-        param($workdir, $nodeID, $kvPort, $raftPort, $peers, $peerIDs, $logPath)
+        param($workdir, $nodeID, $kvPort, $raftPort, $peers, $peerIDs, $logPath, $raftDataRoot, $snapThreshold)
         Set-Location $workdir
         $env:NODE_ID = $nodeID
         $env:KVSTORE_PORT = "$kvPort"
         $env:RAFT_PORT = "$raftPort"
         $env:PEERS = $peers
         $env:PEER_IDS = $peerIDs
+        $env:RAFT_DATA_DIR = $raftDataRoot
+        $env:RAFT_SNAPSHOT_THRESHOLD = "$snapThreshold"
         go run . *>&1 | Tee-Object -FilePath $logPath -Append
-    } -ArgumentList $repo, $id, $cfg.KV, $cfg.Raft, $cfg.Peers, $cfg.PeerIDs, $logFile
+    } -ArgumentList $repo, $id, $cfg.KV, $cfg.Raft, $cfg.Peers, $cfg.PeerIDs, $logFile, $currentDataRoot, $snapshotThreshold
 
     $jobs[$id] = $job
     $activeLogFiles[$id] = $logFile
@@ -128,16 +133,36 @@ function Find-Leader([hashtable]$statuses, [string[]]$ids) {
 }
 
 function Wait-OneLeader([string[]]$ids = $nodeIDs, [int]$TimeoutSec = 15) {
+    return Wait-LeaderStable -ids $ids -TimeoutSec $TimeoutSec -ConsecutiveChecks 5 -SampleMs 250
+}
+
+function Wait-LeaderStable(
+    [string[]]$ids = $nodeIDs,
+    [int]$TimeoutSec = 15,
+    [int]$ConsecutiveChecks = 5,
+    [int]$SampleMs = 250
+) {
     $leaderRef = [ref] ""
+    $stableCountRef = [ref] 0
     $ok = Wait-Until {
         $statuses = Get-AllRaftStatuses -ids $ids
         $leader = Find-Leader -statuses $statuses -ids $ids
         if ([string]::IsNullOrWhiteSpace($leader)) {
+            $leaderRef.Value = ""
+            $stableCountRef.Value = 0
             return $false
         }
-        $leaderRef.Value = $leader
-        return $true
-    } -TimeoutSec $TimeoutSec -SleepMs 300
+
+        if ($leaderRef.Value -eq $leader) {
+            $stableCountRef.Value++
+        }
+        else {
+            $leaderRef.Value = $leader
+            $stableCountRef.Value = 1
+        }
+
+        return ($stableCountRef.Value -ge $ConsecutiveChecks)
+    } -TimeoutSec $TimeoutSec -SleepMs $SampleMs
 
     if (-not $ok) {
         return $null
@@ -145,8 +170,18 @@ function Wait-OneLeader([string[]]$ids = $nodeIDs, [int]$TimeoutSec = 15) {
     return $leaderRef.Value
 }
 
+function Wait-StableLeader(
+    [string[]]$ids = $nodeIDs,
+    [int]$TimeoutSec = 15,
+    [int]$ConsecutiveChecks = 5,
+    [int]$SampleMs = 250
+) {
+    return Wait-LeaderStable -ids $ids -TimeoutSec $TimeoutSec -ConsecutiveChecks $ConsecutiveChecks -SampleMs $SampleMs
+}
+
 function Start-Cluster {
     $script:clusterRun++
+    $script:currentDataRoot = Join-Path $repo ("data\test-ah-{0}-run{1}" -f $sessionTag, $clusterRun)
     foreach ($id in $nodeIDs) {
         Start-Node $id
     }
@@ -163,7 +198,13 @@ function Invoke-Set([int]$kvPort, [string]$key, [string]$value) {
     $uri = "http://localhost:$kvPort/set"
     $body = @{ key = $key; value = $value } | ConvertTo-Json -Compress
     try {
-        $resp = Invoke-WebRequest -Method Put -Uri $uri -ContentType "application/json" -Body $body -TimeoutSec 5 -UseBasicParsing
+        $resp = Invoke-WebRequest `
+            -Method Put `
+            -Uri $uri `
+            -ContentType "application/json" `
+            -Body $body `
+            -TimeoutSec 5 `
+            -UseBasicParsing
         $statusCode = To-StatusCode $resp.StatusCode
         if ($statusCode -lt 0 -and $resp.BaseResponse) {
             $statusCode = To-StatusCode $resp.BaseResponse.StatusCode
@@ -254,6 +295,10 @@ function Wait-KeyValueOnNode([string]$id, [string]$key, [string]$expected, [int]
         $r = Invoke-GetKey -kvPort $kvPort -key $key
         return ($r.Status -eq 200 -and $null -ne $r.Json -and [string]$r.Json.value -eq $expected)
     } -TimeoutSec $TimeoutSec -SleepMs 250
+}
+
+function Wait-Key([string]$id, [string]$key, [string]$expected, [int]$TimeoutSec = 10) {
+    return Wait-KeyValueOnNode -id $id -key $key -expected $expected -TimeoutSec $TimeoutSec
 }
 
 function Wait-KeyValueOnAll([string]$key, [string]$expected, [string[]]$ids = $nodeIDs, [int]$TimeoutSec = 12) {
@@ -356,7 +401,11 @@ try {
         if ($null -eq $now -or $null -eq $preLeaderStatus) {
             return $false
         }
-        return ([int]$now.commitIndex -gt [int]$preLeaderStatus.commitIndex -and [int]$now.lastApplied -ge [int]$now.commitIndex -and [int]$now.logLen -gt [int]$preLeaderStatus.logLen)
+        return (
+            [int]$now.commitIndex -gt [int]$preLeaderStatus.commitIndex -and
+            [int]$now.lastApplied -ge [int]$now.commitIndex -and
+            [int]$now.logLen -gt [int]$preLeaderStatus.logLen
+        )
     } -TimeoutSec 10 -SleepMs 250
     $postLeaderStatus = Get-RaftStatus $leader
     $b2Pass = ($leaderWrite.Status -eq 200 -and $commitAdvanced)
@@ -382,8 +431,18 @@ try {
         (Wait-KeyValueOnAll -key "o3" -expected "3" -ids $nodeIDs -TimeoutSec 12)
     )
     $postC2 = Get-RaftStatus $leader
-    $commitMonotonic = ($null -ne $preC2 -and $null -ne $postC2 -and [int]$postC2.commitIndex -ge ([int]$preC2.commitIndex + 3))
-    $c2Pass = ($w1.Status -eq 200 -and $w2.Status -eq 200 -and $w3.Status -eq 200 -and $readsOrdered -and $commitMonotonic)
+    $commitMonotonic = (
+        $null -ne $preC2 -and
+        $null -ne $postC2 -and
+        [int]$postC2.commitIndex -ge ([int]$preC2.commitIndex + 3)
+    )
+    $c2Pass = (
+        $w1.Status -eq 200 -and
+        $w2.Status -eq 200 -and
+        $w3.Status -eq 200 -and
+        $readsOrdered -and
+        $commitMonotonic
+    )
     Add-Result "C2_multiple_writes_preserve_order" $c2Pass @{
         writeCodes = @($w1.Status, $w2.Status, $w3.Status)
         before     = if ($null -ne $preC2) { $preC2.commitIndex } else { -1 }
@@ -419,7 +478,13 @@ try {
         }
         return ([int]$fs.lastApplied -ge [int]$ls.commitIndex)
     } -TimeoutSec 20 -SleepMs 300
-    $d1Pass = ($dW1.Status -eq 200 -and $dW2.Status -eq 200 -and $dW3.Status -eq 200 -and $catchupRead -and $catchupStatus)
+    $d1Pass = (
+        $dW1.Status -eq 200 -and
+        $dW2.Status -eq 200 -and
+        $dW3.Status -eq 200 -and
+        $catchupRead -and
+        $catchupStatus
+    )
     Add-Result "D1_lagging_follower_catchup" $d1Pass @{
         offlineFollower = $offlineFollower
         writeCodes      = @($dW1.Status, $dW2.Status, $dW3.Status)

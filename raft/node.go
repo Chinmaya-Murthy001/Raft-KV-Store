@@ -24,9 +24,11 @@ type Node struct {
 	state State
 
 	// Persistent-ish state (we will persist these later).
-	currentTerm int
-	votedFor    string
-	log         []LogEntry
+	currentTerm  int
+	votedFor     string
+	logBaseIndex int
+	logBaseTerm  int
+	log          []LogEntry
 
 	// Volatile state on all servers.
 	commitIndex int
@@ -52,15 +54,17 @@ type Node struct {
 	loopDone  chan struct{}
 	applyDone chan struct{}
 	logger    *log.Logger
+	persister *Persister
 
-	kv               store.Store
-	applyCh          chan LogEntry
-	applyQueue       []LogEntry
-	applyLoopRunning bool
-	waitCh           map[int]chan struct{}
-	clientAddr       string
-	leaderClientByID map[string]string
-	leaderRaftByID   map[string]string
+	kv                store.Store
+	applyCh           chan struct{}
+	applyLoopRunning  bool
+	snapshotThreshold int
+	pendingSnapshot   *Snapshot
+	waitCh            map[int]chan struct{}
+	clientAddr        string
+	leaderClientByID  map[string]string
+	leaderRaftByID    map[string]string
 }
 
 type NotLeaderError struct {
@@ -77,6 +81,11 @@ func (e *NotLeaderError) Error() string {
 
 var ErrProposalTimeout = errors.New("proposal timeout")
 
+type snapshotStore interface {
+	Snapshot() map[string]string
+	Restore(map[string]string)
+}
+
 func NewNode(id string, raftPort string, peers []string, logger *log.Logger) *Node {
 	if strings.TrimSpace(id) == "" {
 		id = "node"
@@ -86,24 +95,22 @@ func NewNode(id string, raftPort string, peers []string, logger *log.Logger) *No
 	}
 
 	n := &Node{
-		id:               id,
-		raftPort:         raftPort,
-		peers:            append([]string{}, peers...),
-		state:            Follower,
-		nextIndex:        make(map[string]int),
-		matchIndex:       make(map[string]int),
-		transport:        NewTransport(),
-		rng:              rand.New(rand.NewSource(time.Now().UnixNano() + int64(stableIDHash(id)))),
-		logger:           logger,
-		applyCh:          make(chan LogEntry, 1024),
-		waitCh:           make(map[int]chan struct{}),
-		leaderClientByID: make(map[string]string),
-		leaderRaftByID:   make(map[string]string),
+		id:                id,
+		raftPort:          raftPort,
+		peers:             append([]string{}, peers...),
+		state:             Follower,
+		nextIndex:         make(map[string]int),
+		matchIndex:        make(map[string]int),
+		transport:         NewTransport(),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano() + int64(stableIDHash(id)))),
+		logger:            logger,
+		applyCh:           make(chan struct{}, 1),
+		snapshotThreshold: 50,
+		waitCh:            make(map[int]chan struct{}),
+		leaderClientByID:  make(map[string]string),
+		leaderRaftByID:    make(map[string]string),
 	}
 
-	n.mu.Lock()
-	n.resetElectionTimerLocked()
-	n.mu.Unlock()
 	return n
 }
 
@@ -132,6 +139,7 @@ func (n *Node) Start() error {
 		n.mu.Unlock()
 		return errors.New("raft server already started")
 	}
+	n.resetElectionTimerLocked()
 
 	mux := http.NewServeMux()
 	n.registerHTTPRoutes(mux)
@@ -273,7 +281,10 @@ func (n *Node) requestVotes(stop <-chan struct{}, term int, candidateID string, 
 			defer n.mu.Unlock()
 
 			if resp.Term > n.currentTerm {
-				n.becomeFollowerLocked(resp.Term, "")
+				dirty := n.becomeFollowerLocked(resp.Term, "")
+				if dirty {
+					n.persistLocked()
+				}
 				if n.logger != nil {
 					n.logger.Printf("[raft] %s stepped down due to higher term=%d during vote", n.id, resp.Term)
 				}
@@ -327,6 +338,7 @@ func (n *Node) startElectionLocked() (term int, candidateID string, lastLogIndex
 	n.votesReceived = 1 // self vote
 	n.leaderID = ""
 	n.resetElectionTimerLocked()
+	n.persistLocked()
 
 	total := len(n.peers) + 1
 	majority = total/2 + 1
@@ -344,6 +356,7 @@ func (n *Node) becomeLeaderLocked() {
 	n.leaderAddr = n.selfClientURLLocked()
 	n.leaderClientByID[n.id] = n.leaderAddr
 	n.leaderRaftByID[n.id] = n.selfRaftURL()
+	votedForChanged := n.votedFor != ""
 	n.votedFor = ""
 	n.votesReceived = 0
 	n.electionTerm = 0
@@ -354,16 +367,25 @@ func (n *Node) becomeLeaderLocked() {
 		n.matchIndex[peer] = 0
 	}
 
+	if votedForChanged {
+		n.persistLocked()
+	}
+
 	if n.logger != nil {
 		n.logger.Printf("[raft] %s became leader term=%d", n.id, n.currentTerm)
 	}
 }
 
-func (n *Node) becomeFollowerLocked(term int, leaderID string) {
+func (n *Node) becomeFollowerLocked(term int, leaderID string) bool {
+	stableDirty := false
 	if term > n.currentTerm {
 		n.currentTerm = term
+		stableDirty = true
 	}
 	n.state = Follower
+	if n.votedFor != "" {
+		stableDirty = true
+	}
 	n.votedFor = ""
 	n.votesReceived = 0
 	n.electionTerm = 0
@@ -374,18 +396,19 @@ func (n *Node) becomeFollowerLocked(term int, leaderID string) {
 		n.leaderAddr = addr
 	}
 	n.resetElectionTimerLocked()
+	return stableDirty
 }
 
 func (n *Node) lastLogIndexLocked() int {
 	if len(n.log) == 0 {
-		return 0
+		return n.logBaseIndex
 	}
 	return n.log[len(n.log)-1].Index
 }
 
 func (n *Node) lastLogTermLocked() int {
 	if len(n.log) == 0 {
-		return 0
+		return n.logBaseTerm
 	}
 	return n.log[len(n.log)-1].Term
 }
@@ -401,8 +424,9 @@ func (n *Node) candidateLogUpToDateLocked(lastLogIndex int, lastLogTerm int) boo
 func (n *Node) buildAppendEntriesForPeerLocked(peer string) (AppendEntriesRequest, int) {
 	lastLogIndex := n.lastLogIndexLocked()
 	nextIdx, ok := n.nextIndex[peer]
-	if !ok || nextIdx < 1 {
-		nextIdx = 1
+	minNext := n.logBaseIndex + 1
+	if !ok || nextIdx < minNext {
+		nextIdx = minNext
 	}
 	if nextIdx > lastLogIndex+1 {
 		nextIdx = lastLogIndex + 1
@@ -410,17 +434,14 @@ func (n *Node) buildAppendEntriesForPeerLocked(peer string) (AppendEntriesReques
 	n.nextIndex[peer] = nextIdx
 
 	prevLogIndex := nextIdx - 1
-	prevLogTerm := 0
-	if prevLogIndex > 0 {
-		prevPos := n.indexToSlicePos(prevLogIndex)
-		if prevPos >= 0 && prevPos < len(n.log) {
-			prevLogTerm = n.log[prevPos].Term
-		}
-	}
+	prevLogTerm, _ := n.logTermAtIndexLocked(prevLogIndex)
 
 	entries := make([]LogEntry, 0)
 	if nextIdx <= lastLogIndex {
 		startPos := n.indexToSlicePos(nextIdx)
+		if startPos < 0 {
+			startPos = 0
+		}
 		entries = append(entries, n.log[startPos:]...)
 	}
 
@@ -435,17 +456,20 @@ func (n *Node) buildAppendEntriesForPeerLocked(peer string) (AppendEntriesReques
 	}, len(entries)
 }
 
-func (n *Node) handleAppendResponseLocked(peer string, requestTerm int, prevLogIndex int, sentLen int, resp AppendEntriesResponse) []LogEntry {
+func (n *Node) handleAppendResponseLocked(peer string, requestTerm int, prevLogIndex int, sentLen int, resp AppendEntriesResponse) {
 	if resp.Term > n.currentTerm {
-		n.becomeFollowerLocked(resp.Term, "")
+		dirty := n.becomeFollowerLocked(resp.Term, "")
+		if dirty {
+			n.persistLocked()
+		}
 		if n.logger != nil {
 			n.logger.Printf("[raft] %s stepped down due to higher term=%d from %s", n.id, resp.Term, peer)
 		}
-		return nil
+		return
 	}
 
 	if n.state != Leader || n.currentTerm != requestTerm {
-		return nil
+		return
 	}
 
 	if resp.Success {
@@ -455,30 +479,31 @@ func (n *Node) handleAppendResponseLocked(peer string, requestTerm int, prevLogI
 		}
 
 		next := n.matchIndex[peer] + 1
+		minNext := n.logBaseIndex + 1
 		maxNext := n.lastLogIndexLocked() + 1
-		if next < 1 {
-			next = 1
+		if next < minNext {
+			next = minNext
 		}
 		if next > maxNext {
 			next = maxNext
 		}
 		n.nextIndex[peer] = next
 		n.advanceCommitIndexLocked()
-		return n.drainApplyQueueLocked()
+		return
 	}
 
 	next := n.nextIndex[peer]
-	if next > 1 {
+	minNext := n.logBaseIndex + 1
+	if next > minNext {
 		next--
 	} else {
-		next = 1
+		next = minNext
 	}
 	n.nextIndex[peer] = next
 
 	if n.logger != nil {
 		n.logger.Printf("[raft] %s append rejected by %s; backing off nextIndex=%d", n.id, peer, next)
 	}
-	return nil
 }
 
 func (n *Node) replicateOnce(leaderTerm int) {
@@ -508,9 +533,8 @@ func (n *Node) replicateOnce(leaderTerm int) {
 			}
 
 			n.mu.Lock()
-			toApply := n.handleAppendResponseLocked(peer, request.Term, request.PrevLogIndex, sentCount, resp)
+			n.handleAppendResponseLocked(peer, request.Term, request.PrevLogIndex, sentCount, resp)
 			n.mu.Unlock()
-			n.dispatchApply(toApply)
 		}(req, sentLen)
 	}
 }
@@ -521,7 +545,16 @@ func (n *Node) majority() int {
 }
 
 func (n *Node) logTermAtIndexLocked(index int) (int, bool) {
-	if index <= 0 {
+	if index < 0 {
+		return 0, false
+	}
+	if index == 0 {
+		return 0, true
+	}
+	if index == n.logBaseIndex {
+		return n.logBaseTerm, true
+	}
+	if index < n.logBaseIndex {
 		return 0, false
 	}
 
@@ -569,7 +602,7 @@ func (n *Node) advanceCommitIndexLocked() {
 		if count >= majority {
 			n.commitIndex = idx
 			n.notifyCommitWaitersLocked()
-			n.applyCommittedLocked()
+			n.signalApplyLocked()
 			return
 		}
 	}
@@ -584,31 +617,8 @@ func (n *Node) notifyCommitWaitersLocked() {
 	}
 }
 
-func (n *Node) applyCommittedLocked() {
-	for n.lastApplied < n.commitIndex {
-		nextToApply := n.lastApplied + 1
-		entry, ok := n.logEntryAtIndexLocked(nextToApply)
-		if !ok {
-			return
-		}
-
-		n.lastApplied = nextToApply
-		n.applyQueue = append(n.applyQueue, entry)
-	}
-}
-
-func (n *Node) drainApplyQueueLocked() []LogEntry {
-	if len(n.applyQueue) == 0 {
-		return nil
-	}
-
-	out := append([]LogEntry(nil), n.applyQueue...)
-	n.applyQueue = n.applyQueue[:0]
-	return out
-}
-
 func (n *Node) logEntryAtIndexLocked(index int) (LogEntry, bool) {
-	if index <= 0 {
+	if index <= n.logBaseIndex {
 		return LogEntry{}, false
 	}
 
@@ -627,40 +637,140 @@ func (n *Node) logEntryAtIndexLocked(index int) (LogEntry, bool) {
 	return LogEntry{}, false
 }
 
-func (n *Node) dispatchApply(entries []LogEntry) {
-	if len(entries) == 0 {
-		return
+func (n *Node) signalApplyLocked() {
+	select {
+	case n.applyCh <- struct{}{}:
+	default:
 	}
+}
 
+func (n *Node) signalApply() {
 	n.mu.RLock()
 	running := n.applyLoopRunning
 	n.mu.RUnlock()
-
-	if running {
-		for _, entry := range entries {
-			n.applyCh <- entry
-		}
+	if !running {
+		n.applyCommittedEntries()
 		return
 	}
 
-	for _, entry := range entries {
-		_ = n.applyEntry(entry)
+	select {
+	case n.applyCh <- struct{}{}:
+	default:
 	}
 }
 
 func (n *Node) applyLoop(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-stop:
 			return
-		case entry := <-n.applyCh:
-			if err := n.applyEntry(entry); err != nil && n.logger != nil {
-				n.logger.Printf("[raft] apply error at index=%d term=%d err=%v", entry.Index, entry.Term, err)
-			}
+		case <-ticker.C:
+			n.applyCommittedEntries()
+		case <-n.applyCh:
+			n.applyCommittedEntries()
 		}
 	}
+}
+
+func (n *Node) applyCommittedEntries() {
+	for {
+		n.mu.Lock()
+		if n.lastApplied >= n.commitIndex {
+			n.mu.Unlock()
+			return
+		}
+
+		nextToApply := n.lastApplied + 1
+		entry, ok := n.logEntryAtIndexLocked(nextToApply)
+		n.mu.Unlock()
+		if !ok {
+			return
+		}
+
+		if err := n.applyEntry(entry); err != nil {
+			if n.logger != nil {
+				n.logger.Printf("[raft] apply error at index=%d term=%d err=%v", entry.Index, entry.Term, err)
+			}
+			return
+		}
+
+		n.mu.Lock()
+		if n.lastApplied+1 == entry.Index {
+			n.lastApplied = entry.Index
+			n.maybeSnapshotLocked()
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *Node) maybeSnapshotLocked() {
+	if n.persister == nil || n.snapshotThreshold <= 0 {
+		return
+	}
+	if n.lastApplied <= n.logBaseIndex {
+		return
+	}
+	if n.lastApplied-n.logBaseIndex < n.snapshotThreshold {
+		return
+	}
+
+	s, ok := n.kv.(snapshotStore)
+	if !ok {
+		return
+	}
+
+	snapIndex := n.lastApplied
+	snapTerm, ok := n.logTermAtIndexLocked(snapIndex)
+	if !ok {
+		return
+	}
+
+	snap := Snapshot{
+		LastIncludedIndex: snapIndex,
+		LastIncludedTerm:  snapTerm,
+		KV:                s.Snapshot(),
+	}
+	if err := n.persister.SaveSnapshot(snap); err != nil {
+		if n.logger != nil {
+			n.logger.Printf("[raft] snapshot save failed: %v", err)
+		}
+		return
+	}
+
+	startPos := n.indexToSlicePos(snapIndex + 1)
+	if startPos < 0 {
+		startPos = 0
+	}
+	if startPos > len(n.log) {
+		startPos = len(n.log)
+	}
+	if startPos == len(n.log) {
+		n.log = n.log[:0]
+	} else {
+		n.log = append([]LogEntry(nil), n.log[startPos:]...)
+	}
+	n.logBaseIndex = snapIndex
+	n.logBaseTerm = snapTerm
+	n.persistLocked()
+
+	if n.logger != nil {
+		n.logger.Printf("[raft] snapshot created index=%d term=%d logLen=%d", snapIndex, snapTerm, len(n.log))
+	}
+}
+
+func copyStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 func (n *Node) applyEntry(entry LogEntry) error {
@@ -685,6 +795,20 @@ func (n *Node) applyEntry(entry LogEntry) error {
 func (n *Node) BindStore(kv store.Store) {
 	n.mu.Lock()
 	n.kv = kv
+	if n.pendingSnapshot != nil {
+		if s, ok := n.kv.(snapshotStore); ok {
+			s.Restore(copyStringMap(n.pendingSnapshot.KV))
+			n.pendingSnapshot = nil
+		}
+	}
+	n.mu.Unlock()
+}
+
+func (n *Node) SetSnapshotThreshold(threshold int) {
+	n.mu.Lock()
+	if threshold > 0 {
+		n.snapshotThreshold = threshold
+	}
 	n.mu.Unlock()
 }
 
@@ -712,6 +836,99 @@ func (n *Node) BindAddressBook(nodeKV map[string]string, nodeRaft map[string]str
 		}
 	}
 	n.mu.Unlock()
+}
+
+func (n *Node) InitPersistence(dataDir string) error {
+	dataDir = strings.TrimSpace(dataDir)
+	if dataDir == "" {
+		return errors.New("raft data dir is empty")
+	}
+
+	p := NewPersister(dataDir)
+	snap, hasSnapshot, err := p.LoadSnapshot()
+	if err != nil {
+		return err
+	}
+	st, ok, err := p.Load()
+	if err != nil {
+		return err
+	}
+
+	n.mu.Lock()
+	n.persister = p
+	n.state = Follower
+	n.commitIndex = 0
+	n.lastApplied = 0
+	n.logBaseIndex = 0
+	n.logBaseTerm = 0
+	n.nextIndex = make(map[string]int)
+	n.matchIndex = make(map[string]int)
+	n.pendingSnapshot = nil
+	if hasSnapshot {
+		n.logBaseIndex = snap.LastIncludedIndex
+		n.logBaseTerm = snap.LastIncludedTerm
+		n.commitIndex = n.logBaseIndex
+		n.lastApplied = n.logBaseIndex
+		if n.kv != nil {
+			if s, ok := n.kv.(snapshotStore); ok {
+				s.Restore(copyStringMap(snap.KV))
+			} else {
+				n.pendingSnapshot = &Snapshot{
+					LastIncludedIndex: snap.LastIncludedIndex,
+					LastIncludedTerm:  snap.LastIncludedTerm,
+					KV:                copyStringMap(snap.KV),
+				}
+			}
+		} else {
+			n.pendingSnapshot = &Snapshot{
+				LastIncludedIndex: snap.LastIncludedIndex,
+				LastIncludedTerm:  snap.LastIncludedTerm,
+				KV:                copyStringMap(snap.KV),
+			}
+		}
+	}
+	if ok {
+		n.currentTerm = st.CurrentTerm
+		n.votedFor = st.VotedFor
+		n.log = append([]LogEntry(nil), st.Log...)
+		if st.LogBaseIndex > n.logBaseIndex {
+			n.logBaseIndex = st.LogBaseIndex
+			n.logBaseTerm = st.LogBaseTerm
+		}
+	} else {
+		n.currentTerm = 0
+		n.votedFor = ""
+		n.log = make([]LogEntry, 0)
+	}
+	if n.commitIndex < n.logBaseIndex {
+		n.commitIndex = n.logBaseIndex
+	}
+	if n.lastApplied < n.logBaseIndex {
+		n.lastApplied = n.logBaseIndex
+	}
+	n.persistLocked()
+	n.mu.Unlock()
+
+	return nil
+}
+
+func (n *Node) stableStateLocked() StableState {
+	return StableState{
+		CurrentTerm:  n.currentTerm,
+		VotedFor:     n.votedFor,
+		LogBaseIndex: n.logBaseIndex,
+		LogBaseTerm:  n.logBaseTerm,
+		Log:          append([]LogEntry(nil), n.log...),
+	}
+}
+
+func (n *Node) persistLocked() {
+	if n.persister == nil {
+		return
+	}
+	if err := n.persister.Save(n.stableStateLocked()); err != nil && n.logger != nil {
+		n.logger.Printf("[raft] persist failed: %v", err)
+	}
 }
 
 func (n *Node) Propose(cmd Command) (index int, term int, err error) {
@@ -744,15 +961,15 @@ func (n *Node) Propose(cmd Command) (index int, term int, err error) {
 		Command: cmd,
 	}
 	n.log = append(n.log, entry)
+	n.persistLocked()
 
 	wait := make(chan struct{})
 	n.waitCh[index] = wait
 
 	n.advanceCommitIndexLocked()
-	toApply := n.drainApplyQueueLocked()
 	n.mu.Unlock()
 
-	n.dispatchApply(toApply)
+	n.signalApply()
 	n.replicateOnce(term)
 
 	timeout := time.NewTimer(2 * time.Second)
@@ -770,8 +987,8 @@ func (n *Node) Propose(cmd Command) (index int, term int, err error) {
 }
 
 func (n *Node) indexToSlicePos(index int) int {
-	// log index is 1-based.
-	return index - 1
+	// Log contains entries for indices > logBaseIndex.
+	return index - n.logBaseIndex - 1
 }
 
 type Status struct {
@@ -783,6 +1000,8 @@ type Status struct {
 	LogLen       int            `json:"logLen"`
 	LastLogIndex int            `json:"lastLogIndex"`
 	LastLogTerm  int            `json:"lastLogTerm"`
+	LogBaseIndex int            `json:"logBaseIndex"`
+	LogBaseTerm  int            `json:"logBaseTerm"`
 	Peers        []string       `json:"peers"`
 	NextIndex    map[string]int `json:"nextIndex,omitempty"`
 	MatchIndex   map[string]int `json:"matchIndex,omitempty"`
@@ -814,6 +1033,8 @@ func (n *Node) Status() Status {
 		LogLen:             len(n.log),
 		LastLogIndex:       n.lastLogIndexLocked(),
 		LastLogTerm:        n.lastLogTermLocked(),
+		LogBaseIndex:       n.logBaseIndex,
+		LogBaseTerm:        n.logBaseTerm,
 		Peers:              append([]string{}, n.peers...),
 		ID:                 n.id,
 		LeaderID:           n.leaderID,
@@ -839,30 +1060,47 @@ func statusNextIndex(state State, src map[string]int) map[string]int {
 func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	dirty := false
 
 	if req.Term < n.currentTerm {
 		return RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
 	}
 
 	if req.Term > n.currentTerm {
-		n.becomeFollowerLocked(req.Term, "")
+		if n.becomeFollowerLocked(req.Term, "") {
+			dirty = true
+		}
 	}
 
 	if !n.candidateLogUpToDateLocked(req.LastLogIndex, req.LastLogTerm) {
+		if dirty {
+			n.persistLocked()
+		}
 		return RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
 	}
 
 	if n.votedFor == "" || n.votedFor == req.CandidateID {
+		if n.votedFor != req.CandidateID {
+			dirty = true
+		}
 		n.votedFor = req.CandidateID
 		n.resetElectionTimerLocked()
+		if dirty {
+			n.persistLocked()
+		}
 		return RequestVoteResponse{Term: n.currentTerm, VoteGranted: true}
 	}
 
+	if dirty {
+		n.persistLocked()
+	}
 	return RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
 }
 
 func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
 	n.mu.Lock()
+	dirty := false
+	commitAdvanced := false
 
 	if req.Term < n.currentTerm {
 		resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
@@ -871,10 +1109,15 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	}
 
 	if req.Term > n.currentTerm {
-		n.becomeFollowerLocked(req.Term, req.LeaderID)
+		if n.becomeFollowerLocked(req.Term, req.LeaderID) {
+			dirty = true
+		}
 	} else if req.Term == n.currentTerm {
 		if n.state != Follower || (req.LeaderID != "" && req.LeaderID != n.id) {
 			n.state = Follower
+			if n.votedFor != "" {
+				dirty = true
+			}
 			n.votedFor = ""
 			n.votesReceived = 0
 			n.electionTerm = 0
@@ -897,14 +1140,29 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	n.lastHeartbeat = time.Now()
 
 	if req.PrevLogIndex > n.lastLogIndexLocked() {
+		if dirty {
+			n.persistLocked()
+		}
+		resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
+		n.mu.Unlock()
+		return resp
+	}
+
+	if req.PrevLogIndex < n.logBaseIndex {
+		if dirty {
+			n.persistLocked()
+		}
 		resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
 		n.mu.Unlock()
 		return resp
 	}
 
 	if req.PrevLogIndex > 0 {
-		pos := n.indexToSlicePos(req.PrevLogIndex)
-		if pos < 0 || pos >= len(n.log) || n.log[pos].Term != req.PrevLogTerm {
+		prevTerm, okPrev := n.logTermAtIndexLocked(req.PrevLogIndex)
+		if !okPrev || prevTerm != req.PrevLogTerm {
+			if dirty {
+				n.persistLocked()
+			}
 			resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
 			n.mu.Unlock()
 			return resp
@@ -912,8 +1170,23 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 	}
 
 	for _, entry := range req.Entries {
+		if entry.Index <= n.logBaseIndex {
+			if entry.Index == n.logBaseIndex && entry.Term != n.logBaseTerm {
+				if dirty {
+					n.persistLocked()
+				}
+				resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
+				n.mu.Unlock()
+				return resp
+			}
+			continue
+		}
+
 		pos := n.indexToSlicePos(entry.Index)
 		if pos < 0 {
+			if dirty {
+				n.persistLocked()
+			}
 			resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
 			n.mu.Unlock()
 			return resp
@@ -924,10 +1197,15 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 			if n.log[pos].Term != entry.Term {
 				n.log = n.log[:pos]
 				n.log = append(n.log, entry)
+				dirty = true
 			}
 		case pos == len(n.log):
 			n.log = append(n.log, entry)
+			dirty = true
 		default:
+			if dirty {
+				n.persistLocked()
+			}
 			resp := AppendEntriesResponse{Term: n.currentTerm, Success: false}
 			n.mu.Unlock()
 			return resp
@@ -936,18 +1214,22 @@ func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesRespon
 
 	if req.LeaderCommit > n.commitIndex {
 		last := n.lastLogIndexLocked()
+		prevCommit := n.commitIndex
 		if req.LeaderCommit < last {
 			n.commitIndex = req.LeaderCommit
 		} else {
 			n.commitIndex = last
 		}
+		commitAdvanced = n.commitIndex > prevCommit
 	}
 
-	n.applyCommittedLocked()
-	toApply := n.drainApplyQueueLocked()
+	if dirty {
+		n.persistLocked()
+	}
+	if commitAdvanced {
+		n.signalApplyLocked()
+	}
 	resp := AppendEntriesResponse{Term: n.currentTerm, Success: true}
 	n.mu.Unlock()
-
-	n.dispatchApply(toApply)
 	return resp
 }

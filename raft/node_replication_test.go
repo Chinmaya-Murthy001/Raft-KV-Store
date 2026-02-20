@@ -69,7 +69,7 @@ func TestHandleAppendResponseUpdatesNextAndMatch(t *testing.T) {
 	n.nextIndex["http://p1"] = 2
 	n.matchIndex["http://p1"] = 0
 
-	_ = n.handleAppendResponseLocked("http://p1", 3, 1, 2, AppendEntriesResponse{Term: 3, Success: true})
+	n.handleAppendResponseLocked("http://p1", 3, 1, 2, AppendEntriesResponse{Term: 3, Success: true})
 	if n.matchIndex["http://p1"] != 3 {
 		t.Fatalf("matchIndex=%d want 3", n.matchIndex["http://p1"])
 	}
@@ -80,13 +80,13 @@ func TestHandleAppendResponseUpdatesNextAndMatch(t *testing.T) {
 		t.Fatalf("commitIndex=%d want 3", n.commitIndex)
 	}
 
-	_ = n.handleAppendResponseLocked("http://p1", 3, 3, 0, AppendEntriesResponse{Term: 3, Success: false})
+	n.handleAppendResponseLocked("http://p1", 3, 3, 0, AppendEntriesResponse{Term: 3, Success: false})
 	if n.nextIndex["http://p1"] != 3 {
 		t.Fatalf("nextIndex after fail=%d want 3", n.nextIndex["http://p1"])
 	}
-	_ = n.handleAppendResponseLocked("http://p1", 3, 2, 0, AppendEntriesResponse{Term: 3, Success: false})
-	_ = n.handleAppendResponseLocked("http://p1", 3, 1, 0, AppendEntriesResponse{Term: 3, Success: false})
-	_ = n.handleAppendResponseLocked("http://p1", 3, 0, 0, AppendEntriesResponse{Term: 3, Success: false})
+	n.handleAppendResponseLocked("http://p1", 3, 2, 0, AppendEntriesResponse{Term: 3, Success: false})
+	n.handleAppendResponseLocked("http://p1", 3, 1, 0, AppendEntriesResponse{Term: 3, Success: false})
+	n.handleAppendResponseLocked("http://p1", 3, 0, 0, AppendEntriesResponse{Term: 3, Success: false})
 	if n.nextIndex["http://p1"] != 1 {
 		t.Fatalf("nextIndex floor=%d want 1", n.nextIndex["http://p1"])
 	}

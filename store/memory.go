@@ -62,3 +62,24 @@ func (m *MemoryStore) Delete(key string) error {
 	}
 	return nil
 }
+
+func (m *MemoryStore) Snapshot() map[string]string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	out := make(map[string]string, len(m.data))
+	for k, v := range m.data {
+		out[k] = v
+	}
+	return out
+}
+
+func (m *MemoryStore) Restore(data map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.data = make(map[string]string, len(data))
+	for k, v := range data {
+		m.data[k] = v
+	}
+}

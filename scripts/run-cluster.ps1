@@ -2,17 +2,41 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runNode = Join-Path $scriptDir "run-node.ps1"
 $repo = Split-Path -Parent $scriptDir
 
-Start-Process powershell -WorkingDirectory $repo -ArgumentList @(
-    "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $runNode,
-    "-id", "n1", "-port", "8081", "-raftPort", "9081", "-peers", "http://localhost:9082,http://localhost:9083"
+$nodes = @(
+    @{
+        Id       = "n1"
+        Port     = "8081"
+        RaftPort = "9081"
+        Peers    = "http://localhost:9082,http://localhost:9083"
+    },
+    @{
+        Id       = "n2"
+        Port     = "8082"
+        RaftPort = "9082"
+        Peers    = "http://localhost:9081,http://localhost:9083"
+    },
+    @{
+        Id       = "n3"
+        Port     = "8083"
+        RaftPort = "9083"
+        Peers    = "http://localhost:9081,http://localhost:9082"
+    }
 )
 
-Start-Process powershell -WorkingDirectory $repo -ArgumentList @(
-    "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $runNode,
-    "-id", "n2", "-port", "8082", "-raftPort", "9082", "-peers", "http://localhost:9081,http://localhost:9083"
-)
-
-Start-Process powershell -WorkingDirectory $repo -ArgumentList @(
-    "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $runNode,
-    "-id", "n3", "-port", "8083", "-raftPort", "9083", "-peers", "http://localhost:9081,http://localhost:9082"
-)
+foreach ($node in $nodes) {
+    Start-Process powershell -WorkingDirectory $repo -ArgumentList @(
+        "-NoExit"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        $runNode
+        "-id"
+        $node.Id
+        "-port"
+        $node.Port
+        "-raftPort"
+        $node.RaftPort
+        "-peers"
+        $node.Peers
+    )
+}

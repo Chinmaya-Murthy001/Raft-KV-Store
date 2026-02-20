@@ -4,18 +4,21 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 // Config holds process-level settings used for wiring the service.
 type Config struct {
-	Port     string
-	RaftPort string
-	NodeID   string
-	Peers    []string
-	NodeKV   map[string]string
-	NodeRaft map[string]string
+	Port              string
+	RaftPort          string
+	NodeID            string
+	DataDir           string
+	SnapshotThreshold int
+	Peers             []string
+	NodeKV            map[string]string
+	NodeRaft          map[string]string
 }
 
 // Load reads configuration from environment variables with safe defaults.
@@ -52,9 +55,20 @@ func Load() Config {
 		raftPortForID = "9080"
 	}
 
+	snapshotThreshold := 50
+	if raw := strings.TrimSpace(os.Getenv("RAFT_SNAPSHOT_THRESHOLD")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			snapshotThreshold = parsed
+		}
+	}
+
 	var peers []string
 	var peerIDs []string
 	rawPeers := strings.TrimSpace(os.Getenv("PEERS"))
+	if rawPeers == "" {
+		// Compatibility alias used by some harnesses/docs.
+		rawPeers = strings.TrimSpace(os.Getenv("RAFT_NODES"))
+	}
 	rawPeerIDs := strings.TrimSpace(os.Getenv("PEER_IDS"))
 	if rawPeerIDs != "" {
 		for _, id := range strings.Split(rawPeerIDs, ",") {
@@ -95,12 +109,14 @@ func Load() Config {
 	}
 
 	return Config{
-		Port:     port,
-		RaftPort: raftPort,
-		NodeID:   nodeID,
-		Peers:    peers,
-		NodeKV:   nodeKV,
-		NodeRaft: nodeRaft,
+		Port:              port,
+		RaftPort:          raftPort,
+		NodeID:            nodeID,
+		DataDir:           dataDir(nodeID),
+		SnapshotThreshold: snapshotThreshold,
+		Peers:             peers,
+		NodeKV:            nodeKV,
+		NodeRaft:          nodeRaft,
 	}
 }
 
@@ -199,4 +215,11 @@ func deriveKVURLFromRaftPeer(peer string) (string, bool) {
 	}
 
 	return fmt.Sprintf("%s://%s:%d", u.Scheme, host, kvPort), true
+}
+
+func dataDir(nodeID string) string {
+	if v := strings.TrimSpace(os.Getenv("RAFT_DATA_DIR")); v != "" {
+		return filepath.Join(v, nodeID)
+	}
+	return filepath.Join(".", "data", nodeID)
 }

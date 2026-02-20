@@ -55,10 +55,8 @@ func TestApplyCommittedOnly(t *testing.T) {
 		{Index: 2, Term: 1, Command: Command{Op: OpSet, Key: "b", Value: "2"}},
 	}
 	n.commitIndex = 1
-	n.applyCommittedLocked()
-	firstBatch := n.drainApplyQueueLocked()
 	n.mu.Unlock()
-	n.dispatchApply(firstBatch)
+	n.applyCommittedEntries()
 
 	if v, err := kv.Get("a"); err != nil || v != "1" {
 		t.Fatalf("expected key a to be applied first: got v=%q err=%v", v, err)
@@ -69,10 +67,8 @@ func TestApplyCommittedOnly(t *testing.T) {
 
 	n.mu.Lock()
 	n.commitIndex = 2
-	n.applyCommittedLocked()
-	secondBatch := n.drainApplyQueueLocked()
 	n.mu.Unlock()
-	n.dispatchApply(secondBatch)
+	n.applyCommittedEntries()
 
 	if v, err := kv.Get("b"); err != nil || v != "2" {
 		t.Fatalf("expected key b after commit: got v=%q err=%v", v, err)

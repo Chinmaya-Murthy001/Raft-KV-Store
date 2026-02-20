@@ -110,3 +110,56 @@ Expected:
 ```powershell
 .\scripts\watch-leader.ps1
 ```
+
+# Week 4 Demo
+
+## One-command validation
+Run:
+```powershell
+.\scripts\test-week4.ps1
+```
+
+This runs:
+- Week 3 regression (`A-H`)
+- `P1` follower crash/restart catch-up
+- `P2` leader crash/restart rejoin as follower
+- `P3` uncommitted write never appears after crash/restart
+- `S1` snapshot survives restart (if snapshot script is present)
+
+## Manual Week 4 flow
+### 1) Start cluster
+```powershell
+.\scripts\run-cluster.ps1
+```
+
+### 2) Write initial keys
+```powershell
+Invoke-RestMethod -Method Put -Uri "http://localhost:8081/set" -ContentType "application/json" -Body '{"key":"w4-a","value":"1"}'
+Invoke-RestMethod -Method Put -Uri "http://localhost:8081/set" -ContentType "application/json" -Body '{"key":"w4-b","value":"2"}'
+```
+
+### 3) Follower restart catch-up
+- Stop one follower.
+- Write more keys to leader.
+- Restart follower.
+- Verify follower reads all keys.
+
+### 4) Leader crash and old leader rejoin
+- Stop current leader.
+- Wait for new leader.
+- Write another key to new leader.
+- Restart old leader.
+- Verify old leader rejoins as follower and all nodes read all keys.
+
+### 5) Uncommitted write safety
+- Stop both followers.
+- Send write to isolated leader (expect timeout/failure).
+- Stop isolated leader.
+- Restart all nodes.
+- Verify the uncommitted key does not exist on any node.
+
+### 6) Snapshot restart check
+- Write many keys (enough to cross `RAFT_SNAPSHOT_THRESHOLD`).
+- Confirm `snapshot.json` exists in node data dir.
+- Restart that node.
+- Verify keys are still readable.
