@@ -42,7 +42,7 @@ try {
     }
 
     Write-Host ""
-    Write-Host "PASS: Week 4 test runner completed."
+    Write-Host "PASS: Full validation runner completed."
 }
 catch {
     Write-Error ("FAIL: test-week4 stopped on step failure: {0}" -f $_.Exception.Message)
